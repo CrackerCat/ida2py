@@ -6,7 +6,7 @@ An intuitive query API for IDA Pro
 
 All global variables with defined names and types are now accessible directly in IDAPython.
 
-<img alt="Accessing a global array of integers" src="./img/dark/arr.png">   
+<img alt="Accessing a global array of integers" src="./img/arr.png">   
     
 
 ida2py supports [most](#the-ida2py-type-system) IDA data types, including arrays, structs, pointers or a combination of the above. To convert a variable to a (primitive) Python object, simply call `.pyval()`.  
