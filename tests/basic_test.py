@@ -40,4 +40,21 @@ assert arr_ptr[0] == 1
 assert arr_ptr[1] == 2
 
 
+arr_ptr2 = (ulong * 2).ptr() @ arr_ptr.address
+
+print(arr_ptr2)
+assert arr_ptr2.pyval() == [8589934593, 17179869187]
+
+idc.parse_decls("""
+struct Node{
+    unsigned long val;
+    Node* left;
+    Node* right;
+};
+""", 0)
+idc.SetType(n1.address, "Node")
+
+assert n1.val == 90
+assert n1.pyval() == {'val': 0x5a, 'left': {'val': 0x56, 'left': {'val': 0x1, 'left': None, 'right': None}, 'right': None}, 'right': {'val': 0x41, 'left': None, 'right': None}}
+
 idapro.close_database(False)

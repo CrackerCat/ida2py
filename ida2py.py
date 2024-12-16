@@ -340,7 +340,7 @@ class PointerWrapper(Wrapper):
             ida_typeinf.parse_decl(tinfo, None, f"char[];", ida_typeinf.PT_SIL)
         else:
             tinfo = None
-            if self._tinfo_hint is None or get_whole:
+            if self._tinfo_hint is None:
                 tinfo = get_type_at_address(pointed_addr)
             if tinfo is None:
                 tinfo = self._tinfo_hint
