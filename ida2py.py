@@ -1,3 +1,4 @@
+import collections
 import ida_bytes
 import idc
 import __main__
@@ -12,7 +13,9 @@ import ida_bytes
 import idaapi
 import ida_nalt
 import ida_funcs
+import ida_idp
 import idautils
+import ida_hexrays
 
 import typing
 from copy import copy
@@ -23,6 +26,7 @@ state = None
 class context:
     print_style = 'dec'
     auto_deref = False
+    executor: typing.Optional["Executor"] = None
 
 context.print_style = 'dec'
 
@@ -140,7 +144,7 @@ class IntWrapper(Wrapper, metaclass=IntWrapperMeta):
     
     def _get_value(self):
         try:
-            return int.from_bytes(idc.get_bytes(self.address, self.bits//8), self.byte_order, signed=self.signed)
+            return int.from_bytes(idc.get_bytes(int(self.address), self.bits//8), self.byte_order, signed=self.signed)
         except TypeError:
             return Invalid
     
@@ -211,7 +215,7 @@ class ArrayWrapper(Wrapper):
             raise IndexError(f"Array index {index} cannot be negative")
         elem = copy(self._t)
         elem._value = None
-        elem.address = self.address + int(index) * elem.__sizeof__()
+        elem.address = self.address + index * elem.__sizeof__()
         return elem
     
     def __len__(self):
@@ -391,6 +395,16 @@ class PointerWrapper(Wrapper):
     def __getitem__(self, index):
         if index == 0 and self.address is None:
             return self.value
+        if isinstance(index, slice):
+            if index.stop is None:
+                raise ValueError("Slice must have an end index")
+            start, stop, stride = index.indices(index.stop)
+            out = []
+            for i in range(start, stop, stride):
+                out.append(self[i])
+            if self._is_string:
+                return bytes(out)
+            return out
         pointed_addr = read_pointer(self.address)
         if pointed_addr is Invalid:
             return pointed_addr
@@ -401,7 +415,7 @@ class PointerWrapper(Wrapper):
             elem_size = tif.get_size()
         else:
             elem_size = self.value.__sizeof__()
-        pointed_addr += int(index) * elem_size
+        pointed_addr += index * elem_size
         return self._deref_at_address(pointed_addr)
     
     def __call__(self, val):
@@ -491,7 +505,6 @@ class StructWrapper(Wrapper):
             return t
         raise AttributeError(f"struct '{self._name}' has no member {key}")
 
-
 class FunctionWrapper(Wrapper):
     _tif: ida_typeinf.tinfo_t
     _func: ida_funcs.func_t
@@ -541,8 +554,230 @@ class FunctionWrapper(Wrapper):
     def __copy__(self) -> "Wrapper":
         return FunctionWrapper(self._tif, self._func, self.address)
     
+    @staticmethod 
+    def argloc_to_simarg(argloc, type):
+        import angr
+        size = type.get_size()
+        if size == idc.BADADDR:
+            return
+        if not argloc.is_fragmented():
+            if argloc.is_reg1():
+                return angr.calling_conventions.SimRegArg(
+                    ida_idp.get_reg_name(argloc.reg1(), size),
+                    size,
+                    reg_offset=argloc.regoff()
+                )
+            elif argloc.in_stack():
+                return angr.calling_conventions.SimRegArg(argloc.stkoff(), size)
+        raise NotImplementedError("Cannot convert to simarg")
+    
+    @functools.cached_property
+    def cc(self):
+        assert context.executor is not None, "Cannot call function without executor"
+        import angr
+
+
+        class UsercallArgSession:
+            """
+            An argsession for use with SimCCUsercall
+            """
+
+            __slots__ = (
+                "cc",
+                "real_args",
+            )
+
+            def __init__(self, cc):
+                self.cc = cc
+                # The acutual UsercallArgSession has a bug here
+                self.real_args = angr.calling_conventions.SerializableListIterator(self.cc.args)
+
+            def getstate(self):
+                return self.real_args.getstate()
+
+            def setstate(self, state):
+                self.real_args.setstate(state)
+
+        class SimCCUsercall(angr.calling_conventions.SimCC):
+            def __init__(self, arch, args, ret_loc):
+                super().__init__(arch)
+                self.args = args
+                self.ret_loc = ret_loc
+
+            ArgSession = UsercallArgSession
+
+            def next_arg(self, session, arg_type):
+                return next(session.real_args)
+
+            def return_val(self, ty, **kwargs):
+                return self.ret_loc
+            
+        proj: angr.Project = context.executor.proj
+        return SimCCUsercall(
+            arch=proj.arch,
+            args=[FunctionWrapper.argloc_to_simarg(arg.argloc, arg.type) for arg in self._func_data],
+            ret_loc=FunctionWrapper.argloc_to_simarg(self._func_data.retloc, self._func_data.rettype)
+        )
+    
     def __call__(self, *args):
-        raise NotImplementedError()
+        assert context.executor is not None, "Cannot call function without executor"
+        import angr
+        import claripy
+        proj: angr.Project = context.executor.proj
+        state: angr.SimState = context.executor.state
+        def convert_for_angr(val):
+            if isinstance(val, AngrPointer):
+                return val.pointed_address
+            if isinstance(val, StringWrapper) or isinstance(val, IntWrapper):
+                val = val.pyval()
+            elif isinstance(val, str):
+                val = val.encode()
+            if isinstance(val, bytes):
+                return context.executor.buf(val).pointed_address
+            return val
+        args = [convert_for_angr(x) for x in args]
+        addr = self.address
+        if addr < proj.loader.main_object.min_addr:
+            addr += proj.loader.main_object.min_addr
+        func = proj.factory.callable(addr, base_state=state, concrete_only=True)
+        if not self._func_data.is_vararg_cc():
+            if len(self.cc.args) != len(args):
+                raise ValueError(f"Function should be called with {len(self.cc.args)} arguments, but {len(args)} provided")
+            # potentially support usercall, unless is vararg
+            self.cc.RETURN_ADDR = func._cc.return_addr
+            func = proj.factory.callable(addr, base_state=state, concrete_only=True, cc=self.cc)
+            args = [claripy.BVV(arg, simarg.size * 8) for arg, simarg in zip(args, self.cc.args)]
+        result = func(*args)
+        stdout = func.result_state.posix.dumps(1)
+        # Clean up stdout
+        func.result_state.posix.stdout.content = []
+        func.result_state.posix.stdout.pos = 0
+        context.executor.state = func.result_state
+        try:
+            print(stdout.decode(),end="")
+        except UnicodeDecodeError:
+            print(stdout)
+        if not self._func.does_return():
+            print(f"Function does not return")
+            return UnknownWrapper(None)
+        if self._func_data.rettype.is_void():
+            return
+        rettype = ida2py(self._func_data.rettype)
+        if rettype is None:
+            print(f"Could not determine return type. Raw value is {result}")
+            return UnknownWrapper(None)
+        if not result.concrete:
+            print(f"Return value '{result}' is not concrete")
+            return UnknownWrapper(None)
+        if isinstance(rettype, PointerWrapper):
+            pointed_type = ida2py(rettype._tinfo_hint)
+            if pointed_type is None or isinstance(pointed_type, UnknownWrapper):
+                pointed_type = IntWrapper(signed=False, bits=8)
+            return AngrPointer(result.concrete_value, pointed_type)
+        else:
+            rettype._value = result.concrete_value
+        return rettype
+
+class AngrPointer:
+    def __init__(self, pointed_address: int, type: Wrapper):
+        self.pointed_address = pointed_address
+        self.type = type
+
+    def _get_mem_info(self, idx):
+        addr = self.pointed_address + idx * self.type.__sizeof__()
+        signed = isinstance(self.type, IntWrapper) and self.type.signed
+        bits = (isinstance(self.type, IntWrapper) and self.type.bits) or get_address_size()*8
+        type_str = f"{'' if signed else 'u'}int{bits}_t"
+        return addr, type_str
+
+    def __getitem__(self, idx: int|slice) -> int|list:
+        mem = context.executor.state.mem
+        if isinstance(idx, slice):
+            if idx.stop is None:
+                raise ValueError("Slice must have an end index")
+            start, stop, stride = idx.indices(idx.stop)
+            out = []
+            for i in range(start, stop, stride):
+                out.append(self[i])
+            return out
+        addr, type_str = self._get_mem_info(idx)
+        return getattr(mem[addr], type_str).concrete
+    
+    def __setitem__(self, idx: int|slice, val: int|list):
+        mem = context.executor.state.mem
+        if isinstance(idx, slice):
+            if idx.stop is None:
+                raise ValueError("Slice must have an end index")
+            start, stop, stride = idx.indices(idx.stop)
+            if not isinstance(val, (list, tuple)):
+                raise TypeError("Can only assign an iterable to slice")
+            val = list(val)  # Convert to list to check length
+            if len(val) != len(range(start, stop, stride)):
+                raise ValueError("Iterable length does not match slice length")
+            for i, v in zip(range(start, stop, stride), val):
+                self[i] = v
+            return
+        addr, type_str = self._get_mem_info(idx)
+        setattr(mem[addr], type_str, val)
+
+    def bytes(self, n=None):
+        if n is None:
+            try:
+                return context.executor.state.mem[self.pointed_address].string.concrete
+            except ValueError:
+                return b""
+        return bytes(context.executor.state.mem[self.pointed_address].byte.array(n).concrete)
+    
+    def set_bytes(self, b):
+        for i, x in enumerate(b):
+            context.executor.state.mem[self.pointed_address + i].byte = x
+    
+    def __repr__(self):
+        return f"Pointer to {self.type.type_name()} @ Angr[{hex(self.pointed_address)}]"
+
+class Executor:
+    def __init__(self, proj, state):
+        self.proj = proj
+        self.state = state
+        self.old = None
+
+    def malloc(self, size: int) -> AngrPointer:
+        result = self.state.heap.allocate(size)
+        pointed_type = IntWrapper(signed=False, bits=8)
+        return AngrPointer(result, pointed_type)
+    
+    def buf(self, b: bytes):
+        buf = self.malloc(len(b))
+        buf.set_bytes(b)
+        return buf
+    
+    def __enter__(self):
+        self.old = context.executor
+        context.executor = self
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        context.executor = self.old
+
+
+def angr_exec(filepath=None, proj=None, state=None):
+    print("Initializing angr...")
+    import angr
+    import logging
+    logging.getLogger('angr').setLevel("WARNING")
+    
+    if proj is None:
+        proj = angr.Project(filepath or idaapi.get_input_file_path(), auto_load_libs=False)
+
+    if state is None:
+        state = proj.factory.blank_state(add_options=(
+            {
+                angr.options.ZERO_FILL_UNCONSTRAINED_MEMORY,
+                angr.options.ZERO_FILL_UNCONSTRAINED_REGISTERS,
+            } | angr.options.unicorn
+        ))
+    print("Angr initialized successfully")
+    return Executor(proj, state)
 
 class UnknownWrapper(Wrapper):
     def __init__(self, address):
@@ -588,14 +823,9 @@ def read_pointer(ea):
         return Invalid
 
 def get_type_at_address(ea) -> ida_typeinf.tinfo_t | None:
-    t_str = idc.get_type(ea)
     tinfo = ida_typeinf.tinfo_t()
-    if t_str is not None:
-        t_str += ";"
-        t_str = t_str.replace("(", " x(")
-        result = ida_typeinf.parse_decl(tinfo, None, t_str, ida_typeinf.PT_SIL)
-        if result is not None:
-            return tinfo
+    if ida_nalt.get_tinfo(tinfo, ea):
+        return tinfo
     flags = ida_bytes.get_flags(ea)
     if not ida_bytes.is_loaded(ea):
         return None
@@ -655,6 +885,9 @@ def ida2py(tif: ida_typeinf.tinfo_t, addr: int|None = None) -> Wrapper|None:
     
     if tif.is_func():
         func = idaapi.get_func(addr)
+        # Decompile function to get latest type information
+        ida_hexrays.decompile(addr, flags=ida_hexrays.DECOMP_WARNINGS)
+        tif = get_type_at_address(addr)
         return FunctionWrapper(tif, func, addr)
     
     if tif.is_typedef():
@@ -731,6 +964,8 @@ def hook(g):
         def __getitem__(self, key, dict=dict, obase=obase):
             try:
                 obase.value = dict
+                if key == "angr_exec":
+                    return angr_exec
                 if key == "_ida":
                     return _ida
                 if key in self:
@@ -752,6 +987,8 @@ if __name__.startswith("__plugins__"):
         def __getitem__(self, key, dict=dict, obase=obase):
             try:
                 obase.value = dict
+                if key == "angr_exec":
+                    return angr_exec
                 if key == "_ida":
                     return _ida
                 if key in self:

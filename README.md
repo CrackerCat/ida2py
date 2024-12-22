@@ -23,11 +23,36 @@ You can either use `Type @ address` or `Type(address)`.
 
 If your variable/type name is not a valid Python identifier, you can use the `_ida(name)` function to obtain a reference to it instead. For example, `_ida("Node") == Node`.
 
+### angr integration
+
+Using the `angr_exec` context manager, you can emulate functions by directly calling them.
+
+![Emulating flareon 11's sshd decryption](./img/sshd.png)
+
+You will need to have `angr` installed. The Unicorn engine will be used where possible. If you need more customization, you can pass `proj` and `state` arguments to `angr_exec`.
+
+`__usercall` calling convention is supported, but Golang CC has not been tested and probably doesn't work. Passing floats as arguments is not currently supported.
+
+Symbolic execution is not currently supported. Arguments passed to functions must be concrete.
+
+Some functions, such as `srand`, `time` and `rand`, will not be emulated. You will need to implement these functions via angr hooks if required.
+
 For more detailed/advanced usage, refer to the [tests](./tests/).
 
 ## Installation
 
 Simply copy `ida2py.py` to your IDA plugin directory.
+
+You don't need to install `angr` to use ida2py's base features.
+
+
+### angr integration
+ida2py has been tested to work with angr `9.2.133`, the latest version as of writing.
+
+You can install it by running
+```shell
+python3 -m pip install angr==9.2.133
+```
 
 ## How it works
 
