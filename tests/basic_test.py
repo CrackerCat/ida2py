@@ -12,6 +12,8 @@ try:
 
     ida2py.hook(globals())
 
+    print("arr_ptr", arr_ptr)
+
     print("names", names)
     assert type(names) is ida2py.PointerWrapper
     assert names.pyval() == b"hell"

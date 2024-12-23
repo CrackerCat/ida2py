@@ -427,9 +427,12 @@ class PointerWrapper(Wrapper):
             return t
     
     def __getattr__(self, key):
-        if isinstance(self.value, StructWrapper):
-            return self.value.__getattr__(key)
-        raise AttributeError(f"PointerWrapper object has no attribute {key}")
+        try:
+            return object.__getattribute__(self, key)
+        except AttributeError:
+            if isinstance(self.value, StructWrapper):
+                return self.value.__getattr__(key)
+            raise AttributeError(f"PointerWrapper object has no attribute {key}")
 
 
 class StructWrapper(Wrapper):
@@ -890,7 +893,7 @@ def ida2py(tif: ida_typeinf.tinfo_t, addr: int|None = None) -> Wrapper|None:
         tif = get_type_at_address(addr)
         return FunctionWrapper(tif, func, addr)
     
-    if tif.is_typedef():
+    if hasattr(tif, "is_typedef") and tif.is_typedef():
         typename = tif.get_final_type_name()
         tif2 = ida_typeinf.tinfo_t()
         ida_typeinf.parse_decl(tif2, None, f"{typename};", ida_typeinf.PT_SIL)
