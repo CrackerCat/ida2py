@@ -7,14 +7,12 @@ cur_dir = os.path.dirname(__file__)
 sys.path.append(f"{cur_dir}/..")
 idapro.open_database(f"{cur_dir}/binaries/rc4", True)
 
-import ida2py
-import ida_hexrays
-
-# Angr doesn't like being global hooked in a test environment
-# But it works in normal IDA
-
-# ida2py.hook(globals())
 try:
+    import ida2py
+    # Angr doesn't like being global hooked in a test environment
+    # But it works in normal IDA
+
+    # ida2py.hook(globals())
     key = "SecretKey123"
     ct = b"\x01\x83\xb8#\xba\x8d^\xb6L\xd0}Jx\xc9\xe8"
     with ida2py.angr_exec():

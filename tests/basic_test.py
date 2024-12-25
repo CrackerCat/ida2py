@@ -57,7 +57,21 @@ try:
     """, 0)
     idc.SetType(n1.address, "Node")
 
+    print("n1", n1)
     assert n1.val == 90
     assert n1.pyval() == {'val': 0x5a, 'left': {'val': 0x56, 'left': {'val': 0x1, 'left': None, 'right': None}, 'right': None}, 'right': {'val': 0x41, 'left': None, 'right': None}}
+
+    # Autocomplete tests
+    print(dir(_ida))
+    assert all(x in dir(_ida) for x in ["n1", "names", "arr_ptr", "main"])
+    # TODO: Will be fixed in next version with type detection
+    # assert "arr" in dir(_ida)
+    def build_hints():
+        assert _ida.n1.__class__.__name__ == "Node", _ida.n1.__class__.__name__
+    build_hints()
+    _ida.n1
+    _ida.n1
+    # Test adaptive ordering
+    assert dir(_ida)[0] == "n1", dir(_ida)
 finally:
     idapro.close_database(False)

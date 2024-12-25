@@ -24,6 +24,9 @@ state = None
 class context:
     print_style = 'dec'
     auto_deref = False
+    indent_width = 2
+    max_line_width = 80
+    max_display_count = 16
     executor: typing.Optional["Executor"] = None
 
 context.print_style = 'dec'
@@ -58,6 +61,16 @@ class IntWrapperMeta(type):
         
         return super().__new__(cls, name, bases, namespace)
 
+def auto_indent(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        depth = kwargs.get('depth', 0)
+        result = str(func(*args, **kwargs))
+        indent = ' ' * depth
+        return indent + result.replace('\n', '\n' + indent)
+    wrapper.__signature__ = inspect.signature(func)
+    return wrapper
+
 @functools.total_ordering
 class Wrapper:
     address: int|None = None
@@ -76,10 +89,11 @@ class Wrapper:
     def type_name(self):
         raise NotImplementedError()
     
-    def array_repr(self):
+    @auto_indent
+    def array_repr(self, depth=0):
         raise NotImplementedError()
     
-    def addr_repr(self):
+    def _addr_repr(self):
         return f' @ {hex(self.address)}' if self.address is not None else ''
 
     def pyval(self):
@@ -120,6 +134,16 @@ class Wrapper:
     
     def __bool__(self):
         return bool(self.value)
+    
+    def __dir__(self):
+        # Make private properties actually "private"
+        prefixes = []
+        s = self.__class__
+        while s != object:
+            prefixes.append(f"_{s.__name__}__")
+            s = s.__base__
+        hide_names = ["_addr_repr", "_get_value", "_value"]
+        return [name for name in super().__dir__() if not (any(name.startswith(prefix) for prefix in prefixes) or name in hide_names)]
 
 class _Invalid:
     def __init__(self):
@@ -147,7 +171,8 @@ class IntWrapper(Wrapper, metaclass=IntWrapperMeta):
     def type_name(self):
         return f"{'' if self.signed else 'U'}Int{self.bits}"
     
-    def array_repr(self):
+    @auto_indent
+    def array_repr(self, depth=0):
         if context.print_style == 'dec':
             return str(self.value)
         else:
@@ -156,7 +181,7 @@ class IntWrapper(Wrapper, metaclass=IntWrapperMeta):
     def __repr__(self):
         if self.address is None and self._value is None:
             return self.type_name()
-        return f"{self.type_name()}({self.array_repr()})" + self.addr_repr()
+        return f"{self.type_name()}({self.array_repr()})" + self._addr_repr()
     
     def __bytes__(self):
         return int.to_bytes(self.value, self.bits//8, self.byte_order, signed=self.signed)
@@ -192,60 +217,68 @@ class IntWrapper(Wrapper, metaclass=IntWrapperMeta):
         return t
 
 class ArrayWrapper(Wrapper):
-    _t: Wrapper
-    _length: int
+    __t: Wrapper
+    __length: int
 
     def __init__(self, t: Wrapper, length):
-        self._t = t
-        self._length = length
+        self.__t = t
+        self.__length = length
         self.address = t.address
 
     def __getitem__(self, index):
         if isinstance(index, slice):
             return self.value.__getitem__(index)
         if index < 0:
-            index += self._length
-        if index >= self._length:
-            raise IndexError(f"Array index {index} out of range for array of size {self._length}")
+            index += self.__length
+        if index >= self.__length:
+            raise IndexError(f"Array index {index} out of range for array of size {self.__length}")
         if index < 0:
             raise IndexError(f"Array index {index} cannot be negative")
-        elem = copy(self._t)
+        elem = copy(self.__t)
         elem._value = None
         elem.address = self.address + index * elem.__sizeof__()
         return elem
     
     def __len__(self):
-        return self._length
+        return self.__length
     
     def __iter__(self):
-        for i in range(self._length):
+        for i in range(self.__length):
             yield self[i]
     
     def _get_value(self):
         out = []
-        for i in range(self._length):
+        for i in range(self.__length):
             out.append(self[i])
         return out
 
     def __sizeof__(self):
-        return self._t.__sizeof__() * self._length
+        return self.__t.__sizeof__() * self.__length
     
     def type_name(self):
-        return self._t.type_name() + f"[{self._length}]"
+        return self.__t.type_name() + f"[{self.__length}]"
     
-    def array_repr(self):
+    @auto_indent
+    def array_repr(self, depth=0):
         if self.address is None:
             return ""
-
-        if self._length > 10:
+        if self.__length > context.max_display_count:
             if self.value:
-                items = self.value[:10]
+                items = self.value[:context.max_display_count]
             else:
-                items = [self[i] for i in range(10)]
+                items = [self[i] for i in range(context.max_display_count)]
         else:
             items = self.value
-        
-        return "{" + (", ".join(x.array_repr() for x in items)) + (", ..." if self._length > 10 else '') + "}"
+        if len(items) == 0:
+            return "{}"
+        parts = [x.array_repr(depth=depth+1) for x in items]
+        multiline = parts[0].count("\n") > 0
+        line_width = sum(len(part.strip()) + 2 for part in parts)
+        if multiline or line_width > context.max_line_width:
+            inner = "\n" + ",\n".join(parts) + (", ..." if self.__length > context.max_display_count else '') + "\n"
+        else:
+            inner = ", ".join(part.strip() for part in parts) + (", ..." if self.__length > context.max_display_count else '')
+        return "{" + inner + "}"
     
     def __bytes__(self):
         out = b""
@@ -254,28 +287,28 @@ class ArrayWrapper(Wrapper):
         return out
     
     def __copy__(self) -> "Wrapper":
-        return ArrayWrapper(self._t, self._length)
+        return ArrayWrapper(self.__t, self.__length)
     
     def __repr__(self) -> str:
-        return self.type_name() + self.array_repr() + self.addr_repr()
+        return self.type_name() + self.array_repr() + self._addr_repr()
 
 
 class StringWrapper(Wrapper):
-    _length: int
-    _str_type: str
+    __length: int
+    __str_type: str
     def __init__(self, length, str_type, address):
-        self._length = length
+        self.__length = length
         self.address = address
         if str_type is None:
             str_type = "char"
-        self._str_type = str_type
+        self.__str_type = str_type
     
     def __getitem__(self, index):
         return self.value.__getitem__(index)
     
     def __len__(self):
-        if self._length:
-            return self._length
+        if self.__length:
+            return self.__length
         return len(self.value)
     
     def __iter__(self):
@@ -283,47 +316,49 @@ class StringWrapper(Wrapper):
     
     def __repr__(self):
         ret = self.array_repr()
-        if self._str_type == 'wchar_t':
+        if self.__str_type == 'wchar_t':
             ret = "L"+ret[1:]
-        return ret + self.addr_repr()
+        return ret + self._addr_repr()
     
     def __str__(self):
         return repr(self)
     
     def _get_value(self):
-        res = idc.get_strlit_contents(self.address, strtype=ida_nalt.STRTYPE_C_16 if self._str_type == "wchar_t" else ida_nalt.STRTYPE_C)
+        res = idc.get_strlit_contents(self.address, strtype=ida_nalt.STRTYPE_C_16 if self.__str_type == "wchar_t" else ida_nalt.STRTYPE_C)
         if res:
             return res
         try:
-            return idc.get_bytes(self.address, self._length)
+            return idc.get_bytes(self.address, self.__length)
         except TypeError:
             raise ValueError(f"Could not get bytes at {hex(self.address)}")
        
     def type_name(self):
-        if self._length is None:
-            return f"{self._str_type}[]"
-        return f"{self._str_type}[{self._length}]"
+        if self.__length is None:
+            return f"{self.__str_type}[]"
+        return f"{self.__str_type}[{self.__length}]"
     
-    def array_repr(self):
-        if self._length is not None and self._length > 256:
-            return bytes.__str__(idc.get_bytes(self.address, 256)) + f" and {self._length - 256} more bytes"
+    @auto_indent
+    def array_repr(self, depth=0):
+        if self.__length is not None and self.__length > 256:
+            return bytes.__str__(idc.get_bytes(self.address, 256)) + f" and {self.__length - 256} more bytes"
         return bytes.__str__(self.value)
     
     def __bytes__(self) -> bytes:
         return self.value
     
     def __sizeof__(self) -> int:
-        return len(self) * (2 if self._str_type == "wchar_t" else 1)
+        return len(self) * (2 if self.__str_type == "wchar_t" else 1)
     
     def __copy__(self) -> "Wrapper":
-        return StringWrapper(self._length, self._str_type, self.address)
+        return StringWrapper(self.__length, self.__str_type, self.address)
 
 
 class PointerWrapper(Wrapper):
+    tinfo_hint: ida_typeinf.tinfo_t
     def __init__(self, is_string, tinfo_hint, address):
         self.address = address
-        self._is_string = is_string
-        self._tinfo_hint = tinfo_hint
+        self.__is_string = is_string
+        self.tinfo_hint = tinfo_hint
     
     def _get_value(self):
         pointed_addr = read_pointer(self.address)
@@ -331,19 +366,19 @@ class PointerWrapper(Wrapper):
             return pointed_addr
         if pointed_addr == 0:
             return None
-        return self._deref_at_address(pointed_addr, True)
+        return self.__deref_at_address(pointed_addr, True)
     
 
-    def _deref_at_address(self, pointed_addr, get_whole=False):
-        if self._is_string and get_whole:
+    def __deref_at_address(self, pointed_addr, get_whole=False):
+        if self.__is_string and get_whole:
             tinfo = ida_typeinf.tinfo_t()
             ida_typeinf.parse_decl(tinfo, None, f"char[];", ida_typeinf.PT_SIL)
         else:
             tinfo = None
-            if self._tinfo_hint is None:
+            if self.tinfo_hint is None:
                 tinfo = get_type_at_address(pointed_addr)
             if tinfo is None:
-                tinfo = self._tinfo_hint
+                tinfo = self.tinfo_hint
             
         if tinfo is None:
             print(f"Failed to get type at {hex(pointed_addr)}")
@@ -352,24 +387,27 @@ class PointerWrapper(Wrapper):
        
     def type_name(self):
         if self.address is None:
-            if self._tinfo_hint is None:
+            if self.tinfo_hint is None:
                 return "Unknown*"
             new_tinfo = ida_typeinf.tinfo_t()
-            new_tinfo.create_ptr(self._tinfo_hint)
+            new_tinfo.create_ptr(self.tinfo_hint)
             return new_tinfo.dstr()
-        if self._is_string:
+        if self.__is_string:
             return self.value.type_name()
         return f"{self.value.type_name()}*"
     
-    def array_repr(self):
+    @auto_indent
+    def array_repr(self, depth=0):
         if read_pointer(self.address) == 0:
             return "NULL"
-        if self._is_string:
-            return self.value.array_repr()
+        # Strings and functions within structs/arrays can be understood to be pointers
+        if self.__is_string or (self.tinfo_hint and self.tinfo_hint.is_func()):
+            # Do not increase depth for pointers
+            return self.value.array_repr(depth=depth)
         if read_pointer(self.address) is Invalid:
             return "Invalid"
         if context.auto_deref:
-            return repr(self)
+            return self.value.array_repr(depth=depth).strip()
         return "{" + self.type_name() + "} " + hex(read_pointer(self.address))
 
     def __repr__(self):
@@ -377,7 +415,7 @@ class PointerWrapper(Wrapper):
             return f"Pointer to Invalid"
         if self.value is None:
             return "NULL"
-        return f"Pointer to ({self.value})" + self.addr_repr()
+        return f"Pointer to ({self.value})" + self._addr_repr()
     
     def __bytes__(self) -> bytes:
         return int.to_bytes(read_pointer(self.address), get_address_size(), get_byteorder())
@@ -386,7 +424,7 @@ class PointerWrapper(Wrapper):
         return get_address_size()
     
     def __copy__(self) -> "Wrapper":
-        return PointerWrapper(self._is_string, self._tinfo_hint, self.address)
+        return PointerWrapper(self.__is_string, self.tinfo_hint, self.address)
     
     def __getitem__(self, index):
         if index == 0 and self.address is None:
@@ -398,21 +436,21 @@ class PointerWrapper(Wrapper):
             out = []
             for i in range(start, stop, stride):
                 out.append(self[i])
-            if self._is_string:
+            if self.__is_string:
                 return bytes(out)
             return out
         pointed_addr = read_pointer(self.address)
         if pointed_addr is Invalid:
             return pointed_addr
-        if self._tinfo_hint is not None:
-            tif = self._tinfo_hint
+        if self.tinfo_hint is not None:
+            tif = self.tinfo_hint
             if tif.is_array() and tif.get_size() == 0:
                 tif.remove_ptr_or_array()
             elem_size = tif.get_size()
         else:
             elem_size = self.value.__sizeof__()
         pointed_addr += index * elem_size
-        return self._deref_at_address(pointed_addr)
+        return self.__deref_at_address(pointed_addr)
     
     def __call__(self, val):
         assert self.address is None
@@ -429,16 +467,21 @@ class PointerWrapper(Wrapper):
             if isinstance(self.value, StructWrapper):
                 return self.value.__getattr__(key)
             raise AttributeError(f"PointerWrapper object has no attribute {key}")
+        
+    def __dir__(self):
+        if isinstance(self.value, StructWrapper):
+            return self.value.__dir__()
+        return super().__dir__()
 
 
 class StructWrapper(Wrapper):
-    _tif: ida_typeinf.tinfo_t
-    _name: str
-    _members: dict[str, Wrapper]
+    __tif: ida_typeinf.tinfo_t
+    __name: str
+    __members: dict[str, Wrapper]
     def __init__(self, tif: ida_typeinf.tinfo_t, address):
-        self._tif = tif
-        self._name = tif.get_type_name()
-        self._members = {}
+        self.__tif = tif
+        self.__name = tif.get_type_name()
+        self.__members = {}
         udt = ida_typeinf.udt_type_data_t()
         self.address = address
         if tif.get_udt_details(udt):
@@ -446,13 +489,13 @@ class StructWrapper(Wrapper):
                 udm_type: ida_typeinf.tinfo_t = ida_typeinf.tinfo_t(udm.type)
                 offset = udm.offset//8
                 res = ida2py(udm_type, None)
-                self._members[udm.name] = (offset, res)
+                self.__members[udm.name] = (offset, res)
     
     def _get_value(self):
         assert self.address is not None
         out = {}
-        for key in self._members:
-            offset, t = self._members[key]
+        for key in self.__members:
+            offset, t = self.__members[key]
             t = copy(t)
             t._value = None
             t.address = self.address + offset
@@ -460,20 +503,21 @@ class StructWrapper(Wrapper):
         return out
        
     def type_name(self):
-        return "struct "+self._name
+        return "struct "+self.__name
     
-    def array_repr(self, oneliner=True):
-        lines = []
+    @auto_indent
+    def array_repr(self, depth=0, force_multiline=False):
+        parts = []
         members = sorted(self.value.items(), key=lambda k: k[1][0])
         for name, (offset, type) in members:
-            lines.append(("  " if not oneliner else "") + f"{name} = {type.array_repr()}")
-        if oneliner:
-            return self.type_name() + " {" + ", ".join(lines) + "}"
-        else:
-            return self.type_name() + " {\n" + ",\n".join(lines) + "\n}"
+            parts.append(f"{name} = {type.array_repr(depth=depth+1).strip()}")
+        line_width = sum(len(part) + 2 for part in parts) + 2
+        if line_width > context.max_line_width or force_multiline:
+            return "{\n" + ",\n".join(" " * context.indent_width + part for part in parts) + "\n}"
+        return "{" + ", ".join(parts) + "}"
 
     def __repr__(self):
-        return self.array_repr(False) + self.addr_repr()
+        return self.type_name() + " " + self.array_repr(force_multiline=True) + self._addr_repr()
     
     def __bytes__(self) -> bytes:
         out = b""
@@ -488,10 +532,10 @@ class StructWrapper(Wrapper):
         return out
     
     def __sizeof__(self) -> int:
-        return self._tif.get_size()
+        return self.__tif.get_size()
     
     def __copy__(self) -> "Wrapper":
-        return StructWrapper(self._tif, self.address)
+        return StructWrapper(self.__tif, self.address)
     
     def __getattr__(self, key):
         if key in self.value:
@@ -502,12 +546,15 @@ class StructWrapper(Wrapper):
                 t = copy(t)
                 t.address = self.address + offset
             return t
-        raise AttributeError(f"struct '{self._name}' has no member {key}")
+        raise AttributeError(f"struct '{self.__name}' has no member {key}")
+    
+    def __dir__(self):
+        return super().__dir__() + list(self.__members.keys())
 
 class FunctionWrapper(Wrapper):
-    _tif: ida_typeinf.tinfo_t
-    _func: ida_funcs.func_t
-    _func_data: ida_typeinf.func_type_data_t
+    __tif: ida_typeinf.tinfo_t
+    __func: ida_funcs.func_t
+    __func_data: ida_typeinf.func_type_data_t
     def __init__(self, tif, func, address):
         assert tif.is_func(), f"{tif} is not a function type"
         if idc.get_segm_attr(address, idc.SEGATTR_TYPE) == 1:
@@ -516,42 +563,43 @@ class FunctionWrapper(Wrapper):
             func = ida_funcs.get_func(ea)
             if func is not None:
                 address = next(func.addresses())
-        self._tif = tif
-        self._func = func
-        self._func_data = ida_typeinf.func_type_data_t()
-        assert tif.get_func_details(self._func_data)
+        self.__tif = tif
+        self.__func = func
+        self.__func_data = ida_typeinf.func_type_data_t()
+        assert tif.get_func_details(self.__func_data)
         self.address = address
     
     @property
     def name(self):
-        return idc.get_name(self._func.start_ea)
+        return idc.get_name(self.__func.start_ea)
     
     @property
     def offset_str(self):
-        return (f' + {hex(self.address - self._func.start_ea)}' if self.address != self._func.start_ea else '')
+        return (f' + {hex(self.address - self.__func.start_ea)}' if self.address != self.__func.start_ea else '')
 
     def _get_value(self):
         return f"Function {self.name} at {hex(self.address)}"
        
     def type_name(self):
-        return ida_typeinf.print_tinfo("", 0, 0, 0, self._tif, self.name, "")
+        return ida_typeinf.print_tinfo("", 0, 0, 0, self.__tif, self.name, "")
     
-    def array_repr(self):
+    @auto_indent
+    def array_repr(self, depth=0):
         if self.offset_str:
             return self.name + self.offset_str
-        return f"Function {self.name}"
+        return self.name
 
     def __repr__(self):
-        return self.type_name() + self.offset_str + self.addr_repr()
+        return self.type_name() + self.offset_str + self._addr_repr()
     
     def __bytes__(self) -> bytes:
         raise NotImplementedError("Cannot convert function to bytes")
 
     def __sizeof__(self) -> int:
-        return self._func.size()
+        return self.__func.size()
     
     def __copy__(self) -> "Wrapper":
-        return FunctionWrapper(self._tif, self._func, self.address)
+        return FunctionWrapper(self.__tif, self.__func, self.address)
     
     @staticmethod 
     def argloc_to_simarg(argloc, type):
@@ -614,8 +662,8 @@ class FunctionWrapper(Wrapper):
         proj: angr.Project = context.executor.proj
         return SimCCUsercall(
             arch=proj.arch,
-            args=[FunctionWrapper.argloc_to_simarg(arg.argloc, arg.type) for arg in self._func_data],
-            ret_loc=FunctionWrapper.argloc_to_simarg(self._func_data.retloc, self._func_data.rettype)
+            args=[FunctionWrapper.argloc_to_simarg(arg.argloc, arg.type) for arg in self.__func_data],
+            ret_loc=FunctionWrapper.argloc_to_simarg(self.__func_data.retloc, self.__func_data.rettype)
         )
     
     def __call__(self, *args):
@@ -639,7 +687,7 @@ class FunctionWrapper(Wrapper):
         if addr < proj.loader.main_object.min_addr:
             addr += proj.loader.main_object.min_addr
         func = proj.factory.callable(addr, base_state=state, concrete_only=True)
-        if not self._func_data.is_vararg_cc():
+        if not self.__func_data.is_vararg_cc():
             if len(self.cc.args) != len(args):
                 raise ValueError(f"Function should be called with {len(self.cc.args)} arguments, but {len(args)} provided")
             # potentially support usercall, unless is vararg
@@ -656,12 +704,12 @@ class FunctionWrapper(Wrapper):
             print(stdout.decode(),end="")
         except UnicodeDecodeError:
             print(stdout)
-        if not self._func.does_return():
+        if not self.__func.does_return():
             print(f"Function does not return")
             return UnknownWrapper(None)
-        if self._func_data.rettype.is_void():
+        if self.__func_data.rettype.is_void():
             return
-        rettype = ida2py(self._func_data.rettype)
+        rettype = ida2py(self.__func_data.rettype)
         if rettype is None:
             print(f"Could not determine return type. Raw value is {result}")
             return UnknownWrapper(None)
@@ -669,7 +717,7 @@ class FunctionWrapper(Wrapper):
             print(f"Return value '{result}' is not concrete")
             return UnknownWrapper(None)
         if isinstance(rettype, PointerWrapper):
-            pointed_type = ida2py(rettype._tinfo_hint)
+            pointed_type = ida2py(rettype.tinfo_hint)
             if pointed_type is None or isinstance(pointed_type, UnknownWrapper):
                 pointed_type = IntWrapper(signed=False, bits=8)
             return AngrPointer(result.concrete_value, pointed_type)
@@ -792,7 +840,7 @@ class UnknownWrapper(Wrapper):
         return "Unknown"
 
     def __repr__(self):
-        return "Unknown" + self.addr_repr()
+        return "Unknown" + self._addr_repr()
     
     def __bytes__(self) -> bytes:
         raise ValueError("Cannot convert unknown to bytes")
@@ -898,16 +946,16 @@ def ida2py(tif: ida_typeinf.tinfo_t, addr: int|None = None) -> Wrapper|None:
     return UnknownWrapper(addr)
 
 class TypeConstructor:
-    tinfo: ida_typeinf.tinfo_t
-    wrapper_type: Wrapper
+    __tinfo: ida_typeinf.tinfo_t
+    __wrapper_type: Wrapper
 
     def __init__(self, tinfo: ida_typeinf.tinfo_t):
-        self.tinfo = tinfo
-        self.wrapper_type = ida2py(tinfo)
+        self.__tinfo = tinfo
+        self.__wrapper_type = ida2py(tinfo)
 
     def ptr(self) -> "TypeConstructor":
         new_tinfo = ida_typeinf.tinfo_t()
-        new_tinfo.create_ptr(self.tinfo)
+        new_tinfo.create_ptr(self.__tinfo)
         return TypeConstructor(new_tinfo)
     
     def __mul__(self, length: int) -> "TypeConstructor":
@@ -916,13 +964,13 @@ class TypeConstructor:
         if length <= 0:
             raise ValueError("Cannot multiply type by non-positive length")
         new_tinfo = ida_typeinf.tinfo_t()
-        new_tinfo.create_array(self.tinfo, length)
+        new_tinfo.create_array(self.__tinfo, length)
         return TypeConstructor(new_tinfo)
         
     def __call__(self, addr: int|None=None) -> Wrapper|None:
         if addr is None:
             addr = idc.here()
-        return ida2py(self.tinfo, addr)
+        return ida2py(self.__tinfo, addr)
     
     def __matmul__(self, addr: int) -> Wrapper|None:
         if addr is None:
@@ -930,7 +978,7 @@ class TypeConstructor:
         return self.__call__(addr)
     
     def __repr__(self):
-        return self.wrapper_type.type_name()
+        return self.__wrapper_type.type_name()
 
 class SearchResult(str):
     value: int
@@ -968,7 +1016,7 @@ class Ida2py:
         for address, name in idautils.Names():
             if not ida_bytes.has_user_name(ida_bytes.get_flags(address)):
                 continue
-            if any(not (c.isalnum() or c =="_") for c in name):
+            if any(not (c.isalnum() or c == "_") for c in name):
                 continue
 
             tinfo = get_type_at_address(address)

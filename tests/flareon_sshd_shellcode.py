@@ -7,14 +7,13 @@ cur_dir = os.path.dirname(__file__)
 sys.path.append(f"{cur_dir}/..")
 idapro.open_database(f"{cur_dir}/binaries/flareon_sshd_shellcode", True)
 
-import ida2py
-
-
-# Angr doesn't like being global hooked in a test environment
-# But it works in normal IDA
-
-# ida2py.hook(globals())
 try:
+    import ida2py
+    # Angr doesn't like being global hooked in a test environment
+    # But it works in normal IDA
+
+    # ida2py.hook(globals())
+
     import idc
 
     idc.set_name(0x401CD2, "setup")
