@@ -1,11 +1,9 @@
-import collections
-import ida_bytes
-import idc
 import __main__
 
 from ctypes import *
 import builtins
 import functools
+import inspect
 
 import idc
 import ida_typeinf
@@ -122,8 +120,6 @@ class Wrapper:
     
     def __bool__(self):
         return bool(self.value)
-
-        
 
 class _Invalid:
     def __init__(self):
@@ -936,28 +932,91 @@ class TypeConstructor:
     def __repr__(self):
         return self.wrapper_type.type_name()
 
+class SearchResult(str):
+    value: int
+    accesses: int
+    address: int
+    tif: ida_typeinf.tinfo_t
 
-def _ida(key):
-    if type(key) is int:
-        addr = key
-    else:
-        addr = idc.get_name_ea_simple(key)
-        if addr == idc.BADADDR:
-            tinfo = ida_typeinf.tinfo_t()
-            result = ida_typeinf.parse_decl(tinfo, None, f"{key} x;", ida_typeinf.PT_SIL)
-            if result is not None:
-                return TypeConstructor(tinfo)
-            if key.startswith("u"):
-                result = ida_typeinf.parse_decl(tinfo, None, f"unsigned {key[1:]} x;", ida_typeinf.PT_SIL)
+    def __new__(cls, name, address=None, tif=None, accesses=0):
+        instance = super().__new__(cls, name)
+        instance.accesses = accesses
+        # Deprioritize names with leading underscores
+        instance.__base_value = -(len(name) - len(name.lstrip("_")))
+        # We probably don't care about stuff in the loader segment?
+        if idaapi.getseg(address).is_header_segm():
+            instance.__base_value -= 1
+        instance.address = address
+        instance.tif = tif
+        return instance
+    
+    # Higher, the better
+    @property
+    def value(self):
+        # Prioritize names with more accesses
+        return self.__base_value + self.accesses
+
+    def __lt__(self, other):
+        if not isinstance(other, SearchResult) or self.value == other.value:
+            return str(self) < str(other)
+        return self.value > other.value
+
+class Ida2py:
+    __names: dict[str, SearchResult] = {}
+    def __dir__(self):
+        results = []
+        for address, name in idautils.Names():
+            if not ida_bytes.has_user_name(ida_bytes.get_flags(address)):
+                continue
+            if any(not (c.isalnum() or c =="_") for c in name):
+                continue
+
+            tinfo = get_type_at_address(address)
+            if tinfo is not None:
+                res = SearchResult(name, address, tinfo)
+                if name in self.__names:
+                    res.accesses = self.__names[name].accesses
+                results.append(res)
+                self.__names[name] = res
+        return results
+    
+    def __getattr__(self, name):
+        caller_name = inspect.currentframe().f_back.f_code.co_name
+        if name not in self.__names:
+            raise AttributeError(f"name '{name}' is not defined")
+        
+        # These functions are used in IDA's autocomplete
+        if caller_name not in ["build_hints", "maybe_extend_syntactically"]:
+            # Return the real value when we actually access it
+            self.__names[name].accesses += 1
+            return ida2py(self.__names[name].tif, self.__names[name].address)
+        else:
+            # Return a fake object with the correct type name
+            X = type('X', (object,), {})
+            X.__name__ = self.__names[name].tif.dstr()
+            return X()
+        
+    def __call__(self, key):
+        if type(key) is int:
+            addr = key
+        else:
+            addr = idc.get_name_ea_simple(key)
+            if addr == idc.BADADDR:
+                tinfo = ida_typeinf.tinfo_t()
+                result = ida_typeinf.parse_decl(tinfo, None, f"{key} x;", ida_typeinf.PT_SIL)
                 if result is not None:
                     return TypeConstructor(tinfo)
-            raise NameError(f"name '{key}' is not defined")
-    tinfo = get_type_at_address(addr)
-    if tinfo is not None:
-        ret = ida2py(tinfo, addr)
-        if ret is not None:
-            return ret
-    return UnknownWrapper(addr)
+                if key.startswith("u"):
+                    result = ida_typeinf.parse_decl(tinfo, None, f"unsigned {key[1:]} x;", ida_typeinf.PT_SIL)
+                    if result is not None:
+                        return TypeConstructor(tinfo)
+                raise NameError(f"name '{key}' is not defined")
+        tinfo = get_type_at_address(addr)
+        if tinfo is not None:
+            ret = ida2py(tinfo, addr)
+            if ret is not None:
+                return ret
+        return UnknownWrapper(addr)
 
 # In case global hooking doesn't work
 def hook(g):
@@ -967,21 +1026,18 @@ def hook(g):
         def __getitem__(self, key, dict=dict, obase=obase):
             try:
                 obase.value = dict
-                if key == "angr_exec":
-                    return angr_exec
-                if key == "_ida":
-                    return _ida
                 if key in self:
                     return self[key]
                 if hasattr(builtins, key):
                     return getattr(builtins, key)
                 return _ida(key)
-            
             finally:
                 obase.value = __class__
-
     obase.value = fglobals
+    g["_ida"] = _ida
+    g["angr_exec"] = angr_exec
 
+_ida = Ida2py()
 
 if __name__.startswith("__plugins__"):
     obase = py_object.from_address(id(__main__.__dict__) + 8)
@@ -990,17 +1046,14 @@ if __name__.startswith("__plugins__"):
         def __getitem__(self, key, dict=dict, obase=obase):
             try:
                 obase.value = dict
-                if key == "angr_exec":
-                    return angr_exec
-                if key == "_ida":
-                    return _ida
                 if key in self:
                     return self[key]
                 if hasattr(builtins, key):
                     return getattr(builtins, key)
                 return _ida(key)
-            
             finally:
                 obase.value = __class__
 
     obase.value = fglobals
+    __main__.__dict__["_ida"] = _ida
+    __main__.__dict__["angr_exec"] = angr_exec
