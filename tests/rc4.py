@@ -9,7 +9,7 @@ idapro.open_database(f"{cur_dir}/binaries/rc4", True)
 
 try:
     import ida2py
-    # Angr doesn't like being global hooked in a test environment
+    # angr doesn't like being global hooked in a test environment
     # But it works in normal IDA
 
     # ida2py.hook(globals())

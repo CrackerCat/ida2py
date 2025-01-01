@@ -9,7 +9,7 @@ idapro.open_database(f"{cur_dir}/binaries/flareon_sshd_shellcode", True)
 
 try:
     import ida2py
-    # Angr doesn't like being global hooked in a test environment
+    # angr doesn't like being global hooked in a test environment
     # But it works in normal IDA
 
     # ida2py.hook(globals())
@@ -29,7 +29,7 @@ try:
     ct = bytes.fromhex("A9 F6 34 08 42 2A 9E 1C 0C 03 A8 08 94 70 BB 8D AA DC 6D 7B 24 FF 7F 24 7C DA 83 9E 92 F7 07 1D 02 63 90 2E C1 58")
 
     with ida2py.angr_exec() as executor:
-        state = executor.malloc(0x100)
+        state = executor.alloc(0x100)
         buf = executor.buf(ct)
         
         setup(state, key, nonce, 0)

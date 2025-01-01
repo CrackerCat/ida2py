@@ -33,7 +33,8 @@ You will need to have `angr` installed. The Unicorn engine will be used where po
 
 `__usercall` calling convention is supported, but Golang CC has not been tested and probably doesn't work. Passing floats as arguments is not currently supported.
 
-Symbolic execution is not currently supported. Arguments passed to functions must be concrete.
+Use the `AngrExecutor.buf` function to convert a static string or `claripy.BVS` into memory that is mapped into `angr`
+![angr symbolic execution](./img/angr_symbolic.png)
 
 Some functions, such as `srand`, `time` and `rand`, will not be emulated. You will need to implement these functions via angr hooks if required.
 
