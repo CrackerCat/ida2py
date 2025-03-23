@@ -10,6 +10,7 @@ import ida_typeinf
 import ida_bytes
 import idaapi
 import ida_nalt
+import ida_lines
 import ida_funcs
 import ida_idp
 import idautils
@@ -916,7 +917,12 @@ def get_type_at_address(ea) -> ida_typeinf.tinfo_t | None:
     if ida_bytes.is_code(flags):
         func = idaapi.get_func(ea)
         if ea == func.start_ea:
-            result = ida_typeinf.parse_decl(tinfo, None, "void x();", ida_typeinf.PT_SIL)
+            decomp = ida_hexrays.decompile(ea, flags=ida_hexrays.DECOMP_WARNINGS)
+            if decomp:
+                decl = ida_lines.tag_remove(decomp.print_dcl()) +";"
+            else:
+                decl = "void x();"
+            result = ida_typeinf.parse_decl(tinfo, None, decl, ida_typeinf.PT_SIL)
             if result is not None:
                 return tinfo
         return get_type_at_address(func.start_ea)
