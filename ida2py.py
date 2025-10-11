@@ -15,6 +15,7 @@ import ida_funcs
 import ida_idp
 import idautils
 import ida_hexrays
+import ida_dbg
 
 import typing
 from copy import copy
@@ -605,7 +606,12 @@ class FunctionWrapper(Wrapper):
         return FunctionWrapper(self.tif, self.func, self.address)
     
     def __call__(self, *args):
-        assert context.executor is not None, "Cannot call function without executor"
+        if context.executor is None:
+            if idaapi.get_process_state() == ida_dbg.DSTATE_SUSP:
+                return AppcallExecutor().call(self, args)
+            elif idaapi.get_process_state() == ida_dbg.DSTATE_RUN:
+                raise RuntimeError("Cannot use Appcall while the process is running")
+            raise RuntimeError("Cannot call function without executor")
         return context.executor.call(self, args)
 
 class Executor:
@@ -628,6 +634,16 @@ class Executor:
 
     def call(self, func: FunctionWrapper, args):
         raise NotImplementedError()
+    
+class AppcallExecutor(Executor):
+    def call(self, func: FunctionWrapper, args):
+        def convert_for_appcall(val):
+            if isinstance(val, StringWrapper) or isinstance(val, IntWrapper):
+                val = val.pyval()
+            elif isinstance(val, str):
+                val = val.encode()
+            return val
+        return idaapi.Appcall[func.address](*[convert_for_appcall(x) for x in args])
     
 class AngrExecutor(Executor):
     proj: "angr.Project"
