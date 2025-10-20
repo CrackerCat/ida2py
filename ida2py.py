@@ -1,5 +1,6 @@
 import __main__
 
+import collections
 from ctypes import *
 import builtins
 import functools
@@ -555,10 +556,67 @@ class StructWrapper(Wrapper):
     def __dir__(self):
         return super().__dir__() + list(self.__members.keys())
 
+
+@functools.total_ordering
+class FunctionCall:
+    cexpr: ida_hexrays.cexpr_t
+    cfunc: ida_hexrays.cfunc_t
+    args: typing.List
+    callee: ida_hexrays.cexpr_t
+    ea: int
+
+    def __init__(self, cexpr: ida_hexrays.cexpr_t, cfunc: ida_hexrays.cfunc_t):
+        assert cexpr is not None, "cexpr is none"
+        assert cfunc is not None, "cfunc is none"
+        assert cexpr.opname == "call", f"{cexpr.opname=}"
+        self.cexpr = cexpr
+        self.cfunc = cfunc
+        self.ea = cexpr.ea
+        self.callee = cexpr.x
+        self.args = [arg for arg in cexpr.a]
+    
+    def __eq__(self, other):
+        if not isinstance(other, FunctionCall):
+            return False
+        return self.ea == other.ea
+    
+    def __lt__(self, other):
+        if not isinstance(other, FunctionCall):
+            return NotImplemented
+        return self.ea < other.ea
+
+    def __repr__(self):
+        funcname = self.callee.dstr()
+        return f"{funcname}({', '.join([x.dstr() for x in self.args])}) @ {hex(self.ea)}"
+
+def _find_parent_expr(cfunc, ea, expr_types) -> ida_hexrays.cexpr_t:
+    citem: ida_hexrays.citem_t = cfunc.body.find_closest_addr(ea)
+    cexpr: ida_hexrays.cexpr_t = citem.cexpr
+    depth = 0
+    while cexpr.op not in expr_types and depth < 5:
+        citem = cfunc.body.find_parent_of(citem)
+        if citem is None:
+            return None
+        cexpr = citem.cexpr
+        depth += 1
+    
+    if depth == 5:
+        return None
+    
+    return cexpr
+
+
+def _get_call(cfunc, ea) -> typing.Optional[FunctionCall]:
+    return (call := _find_parent_expr(cfunc, ea, [ida_hexrays.cot_call])) and FunctionCall(call, cfunc)
+
+def get_call(ea) -> typing.Optional[FunctionCall]:
+    return (cfunc := ida_hexrays.decompile(ea, flags=ida_hexrays.DECOMP_WARNINGS)) and _get_call(cfunc, ea)
+
 class FunctionWrapper(Wrapper):
     tif: ida_typeinf.tinfo_t
     func: ida_funcs.func_t
     func_data: ida_typeinf.func_type_data_t
+    decompiled: typing.Optional[ida_hexrays.cfunc_t] = None
     def __init__(self, tif, func, address):
         assert tif.is_func(), f"{tif} is not a function type"
         if idc.get_segm_attr(address, idc.SEGATTR_TYPE) == 1:
@@ -592,6 +650,33 @@ class FunctionWrapper(Wrapper):
         if self.offset_str:
             return self.name + self.offset_str
         return self.name
+    
+    def callsites(self, caller_name=None):
+        import ida_hexrays
+        if type(caller_name) is str:
+            caller_name = lambda x: x == caller_name
+        if caller_name is None:
+            caller_name = lambda x: True
+        xrefs = idautils.XrefsTo(self.func.start_ea)
+        mapping = collections.defaultdict(list)
+        for xref in xrefs:
+            if not xref.iscode:
+                continue
+            caller = ida_funcs.get_func(xref.frm)
+            if not caller:
+                continue
+            _caller_name = idc.get_name(caller.start_ea)
+            if caller_name(_caller_name):
+                mapping[caller.start_ea].append(xref.frm)
+        for caller in mapping.keys():
+            cfunc = ida_hexrays.decompile(caller, flags=ida_hexrays.DECOMP_WARNINGS | ida_hexrays.DECOMP_NO_CACHE) # TODO: handle errors
+            if cfunc is None:
+                print("Failed to decompile", hex(caller))
+                continue
+            for ea in mapping[caller]:
+                callsite = _get_call(cfunc, ea)
+                if callsite is not None:
+                    yield callsite
 
     def __repr__(self):
         return self.type_name() + self.offset_str + self._addr_repr()
